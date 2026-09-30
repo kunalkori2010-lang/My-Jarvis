@@ -1,0 +1,81 @@
+# ── MARK LIII — what never belongs in the repository ──────────────────────────
+# Everything listed here is created by the app on first run. A fresh clone with
+# none of it present boots straight to the setup screen, which is the intended
+# first experience — so nothing here needs to be committed, and some of it must
+# never be.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# NOTE: a '#' only starts a comment at the beginning of a line. Written inline
+# after a pattern, as in "config/api_keys.json  # your key", it becomes part of
+# the pattern — so the line silently matches nothing and the secret it was
+# written to protect gets committed. Every comment below is therefore on a line
+# of its own. Keep it that way.
+#
+# your Gemini API key, plus per-plugin credentials and saved database logins
+config/api_keys.json
+# the dashboard's TLS private key and certificate
+config/certs/
+# The enrolled voiceprint — a vector derived from your voice, so it is a biometric
+# even though no audio is stored. It also unlocks the microphone, so it does not
+# belong in a repository any more than a key does.
+config/voiceprint.json
+# Downloaded speaker-embedding weights for Voice ID (ECAPA-TDNN)
+config/models/
+# a LINKED WhatsApp session — committing it hands somebody your WhatsApp account,
+# not just a key
+config/whatsapp_web/
+# Google OAuth tokens (Gmail / Calendar plugins)
+**/token*.json
+**/client_secret*.json
+*credentials*.json
+.env
+.env.*
+
+# ── Personal data the assistant accumulates about you ─────────────────────────
+memory/long_term.json
+memory/*.db
+# An affect reading is a record of how you were doing, when, and how often. It is
+# the most personal thing this app writes and the least obviously personal by
+# filename — it looks like state, the way long_term.json looks like state.
+memory/affect_state.json
+# The initiative log records when JARVIS chose to speak, whether you answered,
+# and how long you had been quiet. Boring individually; a pattern of
+# availability, if you would rather it lived nowhere near a repo.
+memory/initiative_state.json
+# Belt and braces. An earlier build resolved the base directory without the
+# memory/ segment and dropped these in the repository root, where they are
+# perfectly visible to `git add .` and perfectly easy to miss in review. The
+# path is correct now; this is here so that a regression writes to an ignored
+# location rather than a committed one.
+/initiative_state.json
+/affect_state.json
+
+# ── Python build noise ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editors and operating systems ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+*.log
+logs/
+downloads/
+screenshots/
