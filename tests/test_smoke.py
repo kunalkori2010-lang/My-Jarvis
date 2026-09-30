@@ -21,7 +21,11 @@ def test_action_discovery():
     assert reg.has("send_message"), "send_message action missing"
     assert reg.has("computer_settings"), "computer_settings action missing"
     assert reg.has("web_search"), "web_search action missing"
-    assert len(reg.names()) >= 10, f"too few actions: {len(reg.names())}"
+    assert reg.has("git_helper"), "git_helper action missing"
+    assert reg.has("checklists"), "checklists action missing"
+    assert reg.has("focus_timer"), "focus_timer action missing"
+    assert reg.has("find_phone"), "find_phone action missing"
+    assert len(reg.names()) >= 20, f"too few actions: {len(reg.names())}"
 
 
 def test_plugin_discovery_with_new_plugins():
@@ -86,12 +90,35 @@ def test_dashboard_routes():
               "/api/history", "/api/routines", "/api/usage",
               "/api/audio-test", "/api/staged", "/api/consolidate",
               "/api/plugins/install", "/api/photo", "/api/command",
-              "/api/upload"):
+              "/api/upload", "/api/lists", "/api/backups", "/api/backup",
+              "/api/backup/download", "/api/restore", "/api/presence"):
         assert p in paths, f"route missing: {p}"
 
 
-def test_offline_module_inert():
-    """No Ollama here → feature absent, never loud."""
+def test_offline_module_safe():
+    """Offline brain never raises, with or without Ollama running."""
     from core import offline as off
-    assert off.available() is False
+    assert isinstance(off.available(), bool)
     assert off.chat("") is None
+    r = off.chat("Reply with exactly: OK")
+    assert r is None or isinstance(r, str)
+
+
+def test_macros_focus_lists():
+    from core import routines as rt
+    m = rt.add("smoke-macro", {"kind": "macro", "match": "contains",
+                               "text": "smoke trigger"}, "do smoke things")
+    assert "error" not in m
+    assert rt.match_macro("hey smoke trigger now")["id"] == m["id"]
+    assert rt.match_macro("unrelated") is None
+    assert rt.remove(m["id"]) is True
+    from core import focus as fc
+    assert fc.start(1, "smoke")[:8] == "Focusing"
+    assert fc.active() is True
+    assert fc.hold("x") is True
+    _, summary = fc.stop()
+    assert "Focus over" in summary
+    from core import checklists as cl
+    assert "Added" in cl.add("smoke-list", "smoke item")
+    assert "Checked" in cl.check("smoke-list", "smoke")
+    assert cl.delete_list("smoke-list") is True

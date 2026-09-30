@@ -1060,6 +1060,19 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop:
             return
+        # ── Phrase macros ──────────────────────────────────────────────
+        # A macro hit rewrites the turn into its expansion, so Gemini
+        # executes the steps with normal tools. Checked here (typed) and in
+        # _process_dashboard_commands (remote) — the two text entry points.
+        try:
+            from core import routines as _rt
+            _mac = _rt.match_macro(text)
+            if _mac is not None:
+                self.ui.write_log(f"SYS: Macro — {_mac.get('name')}")
+                text = (f"[MACRO: {_mac.get('name')}] "
+                        f"{_mac.get('command', '')}")
+        except Exception:
+            pass
         # Offline text mode: no session, but the local brain can still answer.
         if not self.session:
             if self._offline:
@@ -1589,7 +1602,8 @@ class JarvisLive:
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None, "session_memory": None,
+                        "dashboard": self._dashboard}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -2218,6 +2232,29 @@ class JarvisLive:
             market_future = loop.run_in_executor(
                 None, _fetch_markets_sync, {"query": get_brief_watchlist()})
 
+        # ── Your own life, pre-fetched like everything else ──────────────
+        # Calendar, unread mail, today's routines and staged memories ride the
+        # same parallel window as news/weather. Each plugin reports its own
+        # "not connected" sentence when OAuth is missing — those are filtered
+        # out at settle time, so an unconnected plugin costs nothing and says
+        # nothing.
+        def _fetch_calendar_today():
+            try:
+                from plugins.calendar import run as _cal
+                return _cal({"mode": "today"})
+            except Exception as e:
+                return f"Calendar unavailable: {e}"
+
+        def _fetch_gmail_unread():
+            try:
+                from plugins.gmail import run as _gm
+                return _gm({"mode": "unread", "limit": "3"})
+            except Exception as e:
+                return f"Gmail unavailable: {e}"
+
+        cal_future = loop.run_in_executor(None, _fetch_calendar_today)
+        gmail_future = loop.run_in_executor(None, _fetch_gmail_unread)
+
         await asyncio.sleep(0.3)
         if not self.session:
             return
@@ -2360,6 +2397,58 @@ class JarvisLive:
                 if _usable(markets_text):
                     extras.append(f"Market snapshot:\n{markets_text}")
 
+                # ── Your own day ─────────────────────────────────────
+                # Calendar + unread mail settle here (they have had all of
+                # phase 1 as lead time). Unconnected plugins report a setup
+                # sentence, which is dropped the same way a failed fetch is.
+                def _usable_plugin(text: str) -> bool:
+                    if not _usable(text):
+                        return False
+                    low = text.lower()
+                    return not any(k in low for k in (
+                        "not connected yet", "sign-in failed", "sign-in failed",
+                        "libraries are missing", "unavailable:"))
+
+                async def _settle_gen(fut, cap):
+                    try:
+                        return await asyncio.wait_for(
+                            asyncio.wrap_future(fut), timeout=cap)
+                    except Exception:
+                        return ""
+
+                cal_text = await _settle_gen(cal_future, 8.0)
+                gmail_text = await _settle_gen(gmail_future, 8.0)
+                if _usable_plugin(cal_text):
+                    extras.append(f"Today's calendar:\n{cal_text}")
+                if _usable_plugin(gmail_text):
+                    extras.append(f"Unread mail:\n{gmail_text}")
+                # Routines due today + memories awaiting review: local reads,
+                # instant, no network.
+                try:
+                    from core import routines as _rt
+                    _today = datetime.now().date().isoformat()
+                    _todays = [r for r in await asyncio.to_thread(_rt.list_all)
+                               if r.get("enabled")
+                               and ((r.get("schedule", {}).get("kind") == "daily")
+                                    or (r.get("schedule", {}).get("kind") == "once"
+                                        and str(r.get("schedule", {}).get("at", ""))
+                                        .startswith(_today)))]
+                    if _todays:
+                        extras.append("Today's automations:\n" + "\n".join(
+                            f"• {r.get('name')}" for r in _todays))
+                except Exception:
+                    pass
+                try:
+                    from core import consolidate as _cs
+                    _staged = await asyncio.to_thread(_cs.list_staged)
+                    if _staged:
+                        extras.append(
+                            f"You have {len(_staged)} memor"
+                            f"{'y' if len(_staged) == 1 else 'ies'} waiting "
+                            "for review in the dashboard.")
+                except Exception:
+                    pass
+
                 if extras:
                     p2 += (
                         "\n\n[BRIEFING] You also already have this — no tools "
@@ -2472,6 +2561,15 @@ class JarvisLive:
                                     initiative.muted):
                                 print("[Monitor] Muted - dropping the rest of this batch.")
                                 break
+                            # Focus holds interruptions instead of speaking them.
+                            try:
+                                from core import focus as _focus_mod
+                                if _focus_mod.active():
+                                    _focus_mod.hold(f"monitor: {alert[:150]}")
+                                    print("[Monitor] Held for focus.")
+                                    continue
+                            except Exception:
+                                pass
                             # ...and the budget, for the same reason. mark_spoken()
                             # below counts this alert against the daily cap, but
                             # counting after the fact is not enforcing: a morning
@@ -2530,6 +2628,17 @@ class JarvisLive:
                         from core import routines as _rt
                         for r in await asyncio.to_thread(_rt.due):
                             try:
+                                # Focus holds routines like everything else.
+                                try:
+                                    from core import focus as _focus_mod
+                                    if _focus_mod.active():
+                                        _focus_mod.hold(
+                                            f"routine {r.get('name')}: "
+                                            f"{str(r.get('command'))[:150]}")
+                                        print(f"[Routines] Held for focus: {r.get('name')}")
+                                        continue
+                                except Exception:
+                                    pass
                                 await self.session.send_client_content(
                                     turns={"role": "user", "parts": [{
                                         "text": (
@@ -2583,6 +2692,94 @@ class JarvisLive:
                 print(f"[Consolidate] ⚠️ loop error: {e}")
             await asyncio.sleep(6 * 3600)  # re-check every 6 h (runs ~daily)
 
+    async def _run_focus_watch(self) -> None:
+        """Announce the end of a focus session with what was held."""
+        was_active = False
+        while True:
+            try:
+                from core import focus as _focus_mod
+                st = await asyncio.to_thread(_focus_mod.status)
+                if st["active"]:
+                    was_active = True
+                elif was_active:
+                    was_active = False
+                    if self.session and self._awake and not self.ui.muted:
+                        queued, summary = await asyncio.to_thread(
+                            _focus_mod.stop)
+                        # stop() already cleared the file; announce only if
+                        # speech is welcome right now.
+                        with self._speaking_lock:
+                            speaking = self._is_speaking
+                        recent = (time.monotonic() - self._last_user_speech) < 10
+                        if not speaking and not recent:
+                            try:
+                                await self.session.send_client_content(
+                                    turns={"role": "user", "parts": [{
+                                        "text": f"[FOCUS OVER] {summary} "
+                                                "Report it in one short message."}]},
+                                    turn_complete=True,
+                                )
+                            except Exception as e:
+                                print(f"[Focus] ⚠️ announce error: {e}")
+                        self.ui.write_log(f"SYS: {summary}")
+            except Exception as e:
+                print(f"[Focus] ⚠️ watch error: {e}")
+            await asyncio.sleep(15)
+
+    async def _run_presence_lock(self) -> None:
+        """Walk-away lock: all paired phones gone longer than the configured
+        threshold → lock the workstation. Off unless opted in (0 = disabled),
+        and never while a confirmation banner waits — locking mid-confirm
+        would strand the decision."""
+        await asyncio.sleep(120)
+        while True:
+            try:
+                if self.session and self._dashboard:
+                    try:
+                        import json as _json
+                        cfg = _json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+                        mins = max(0, min(int(cfg.get("presence_lock_minutes", 0) or 0), 240))
+                    except Exception:
+                        mins = 0
+                    if mins > 0:
+                        pres = await asyncio.to_thread(
+                            self._dashboard.device_presence)
+                        stale = pres.get("stale_sec")
+                        if pres.get("paired", 0) > 0 and stale is not None \
+                                and stale > mins * 60:
+                            try:
+                                from core import confirm as _cg
+                                pending = _cg.pending_title()
+                            except Exception:
+                                pending = ""
+                            if not pending:
+                                import platform as _pf, subprocess as _sp
+                                done = False
+                                try:
+                                    if _pf.system() == "Windows":
+                                        import ctypes as _ct
+                                        done = bool(_ct.windll.user32.LockWorkStation())
+                                    elif _pf.system() == "Linux":
+                                        r = _sp.run(["loginctl", "lock-session"],
+                                                    capture_output=True, timeout=10)
+                                        done = r.returncode == 0
+                                    elif _pf.system() == "Darwin":
+                                        r = _sp.run(["osascript", "-e",
+                                                     'tell application "System Events" to keystroke "q" using {control down, command down}'],
+                                                    capture_output=True, timeout=10)
+                                        done = r.returncode == 0
+                                except Exception as e:
+                                    print(f"[Presence] lock failed: {e}")
+                                if done:
+                                    self.ui.write_log(
+                                        "SYS: Walk-away lock — no paired phone seen "
+                                        f"for {mins} min.")
+                                    print("[Presence] workstation locked.")
+                                    await asyncio.sleep(mins * 60)
+            except Exception as e:
+                print(f"[Presence] ⚠️ loop error: {e}")
+            await asyncio.sleep(60)
+
     async def _warm_embeddings(self) -> None:
         """Load the local embedding model in the background at startup.
 
@@ -2632,6 +2829,14 @@ class JarvisLive:
                 speaking = self._is_speaking
             if speaking:
                 continue
+
+            # Focus session: hold the thought, don't speak it.
+            try:
+                from core import focus as _focus_mod
+                if _focus_mod.active():
+                    continue
+            except Exception:
+                pass
 
             try:
                 from core import initiative, affect
@@ -2777,6 +2982,15 @@ class JarvisLive:
                     # has no desktop WAKE button — so it wakes JARVIS if asleep.
                     if self._wake_enabled and not self._awake:
                         self.wake(reason="remote command")
+                    try:
+                        from core import routines as _rt
+                        _mac = _rt.match_macro(text)
+                        if _mac is not None:
+                            self.ui.write_log(f"SYS: Macro — {_mac.get('name')}")
+                            text = (f"[MACRO: {_mac.get('name')}] "
+                                    f"{_mac.get('command', '')}")
+                    except Exception:
+                        pass
                     await self.session.send_client_content(
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
@@ -2913,6 +3127,8 @@ class JarvisLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_routines())
+                    tg.create_task(self._run_focus_watch())
+                    tg.create_task(self._run_presence_lock())
                     tg.create_task(self._run_consolidation())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())

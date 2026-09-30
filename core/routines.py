@@ -6,6 +6,12 @@ One JSON file, three schedule kinds, no new dependencies:
   {"kind": "daily",    "time": "08:00"}          — every day at 08:00 local
   {"kind": "interval", "minutes": 60}            — every N minutes (N >= 5)
   {"kind": "once",     "at": "2026-10-02T08:00"} — a single future firing
+  {"kind": "macro",    "match": "exact|contains", "text": "studio mode"}
+                                                 — phrase trigger (see below)
+
+Macros never fire on a timer: match_macro(text) is checked against every
+typed or dashboard command in main.py, and a hit rewrites the turn into the
+macro's expansion so Gemini executes the steps with its normal tools.
 
 Routines are the user's explicit instructions, so firing one never consumes
 the proactive-initiative budget and is never "dismissal-learned" away — but
@@ -75,7 +81,15 @@ def validate_schedule(sched: dict) -> tuple[bool, str]:
             if at <= datetime.now():
                 return False, "once needs a future datetime."
             return True, {"kind": "once", "at": at.isoformat(timespec="minutes")}
-        return False, "kind must be daily, interval, or once."
+        if kind == "macro":
+            match = str(sched.get("match", "contains")).strip().lower()
+            text = str(sched.get("text", "")).strip().lower()
+            if match not in ("exact", "contains"):
+                return False, "macro match must be exact or contains."
+            if not text:
+                return False, "macro needs the trigger text."
+            return True, {"kind": "macro", "match": match, "text": text}
+        return False, "kind must be daily, interval, once, or macro."
     except Exception as e:
         return False, f"bad schedule: {e}"
 
@@ -127,6 +141,29 @@ def set_enabled(rid: str, enabled: bool) -> bool:
         if hit:
             _save(routines)
         return hit
+
+
+def match_macro(text: str) -> dict | None:
+    """First enabled macro whose trigger fits `text`, else None. Macros are
+    checked before the turn reaches the model (see _on_text_command)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    with _lock:
+        for r in _load():
+            if not r.get("enabled"):
+                continue
+            s = r.get("schedule", {})
+            if s.get("kind") != "macro":
+                continue
+            trig = str(s.get("text", ""))
+            if not trig:
+                continue
+            if s.get("match") == "exact" and t == trig:
+                return dict(r)
+            if s.get("match", "contains") == "contains" and trig in t:
+                return dict(r)
+    return None
 
 
 def due(now: datetime | None = None) -> list:

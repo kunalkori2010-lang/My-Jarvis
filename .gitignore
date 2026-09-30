@@ -52,6 +52,14 @@ memory/usage.json
 memory/staged_facts.json
 # Consolidation cursor (last run per conversation).
 memory/consolidate_state.json
+# Meeting notes are your words, not source.
+notes/
+# Focus state is transient by design.
+memory/focus_state.json
+# Checklists are yours, not source.
+memory/checklists.json
+# Local backup zips (they duplicate everything above).
+memory/backups/
 # Belt and braces. An earlier build resolved the base directory without the
 # memory/ segment and dropped these in the repository root, where they are
 # perfectly visible to `git add .` and perfectly easy to miss in review. The

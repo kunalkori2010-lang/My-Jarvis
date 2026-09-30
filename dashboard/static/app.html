@@ -224,7 +224,36 @@
       if (m.type === 'sys')           sys(m.text);
       if (m.type === 'file_received') _onFileReceived(m);
       if (m.type === 'hud')           setHud(m);
+      if (m.type === 'beep')          doBeep(m.for || 10);
     };
+
+    // ── Find-my-phone: loud repeating tone + vibration ────────────────────
+    function doBeep(seconds) {
+      seconds = Math.max(1, Math.min(parseInt(seconds) || 10, 30));
+      toast('🔔 Ringing — tap anywhere to stop');
+      try { navigator.vibrate && navigator.vibrate(1000); } catch (_) {}
+      let stopped = false;
+      const stop = () => { stopped = true; };
+      window.addEventListener('pointerdown', stop, { once: true });
+      let ctx;
+      try { ctx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (_) { return; }
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      const endAt = Date.now() + seconds * 1000;
+      const tick = () => {
+        if (stopped || Date.now() > endAt) { ctx.close().catch(() => {}); return; }
+        try {
+          const o = ctx.createOscillator(), g = ctx.createGain();
+          o.type = 'sine'; o.frequency.value = 880;
+          g.gain.setValueAtTime(0.9, ctx.currentTime);
+          g.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.45);
+          o.connect(g); g.connect(ctx.destination);
+          o.start(); o.stop(ctx.currentTime + 0.5);
+        } catch (_) {}
+        setTimeout(tick, 600);
+      };
+      tick();
+    }
 
     // Live PC snapshot (forwarded from the HUD feed): CPU/RAM + uptime.
     function setHud(m) {

@@ -468,6 +468,7 @@ class DashboardServer:
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
+        self._device_seen: dict[str, float] = {}    # device_token → last activity
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
@@ -523,6 +524,27 @@ class DashboardServer:
         except Exception:
             return None
 
+    def _touch_device(self, token: str) -> None:
+        """Record LAN presence for a persistent device token, if we know it."""
+        try:
+            for dev_tok, sess in self._device_sessions.items():
+                if sess.get("session_key") and self._token_keys.get(token) == sess["session_key"]:
+                    self._device_seen[dev_tok] = time.time()
+                    break
+        except Exception:
+            pass
+
+    def device_presence(self) -> dict:
+        """{'paired': n, 'stale_sec': seconds since newest sighting or None}."""
+        try:
+            now = time.time()
+            if not self._device_seen:
+                return {"paired": len(self._device_sessions), "stale_sec": None}
+            return {"paired": len(self._device_sessions),
+                    "stale_sec": int(now - max(self._device_seen.values()))}
+        except Exception:
+            return {"paired": 0, "stale_sec": None}
+
     # ── callbacks ────────────────────────────────────────────────────────
 
     def set_wake_callback(self, fn) -> None:
@@ -532,6 +554,23 @@ class DashboardServer:
         self._connect_callback = fn
 
     # ── broadcast ────────────────────────────────────────────────────────
+
+    def notify_beep(self, seconds: int = 10) -> bool:
+        """Thread-safe: ring connected phones from any thread (e.g. an action
+        running in the executor). Returns False when nobody is listening."""
+        try:
+            if not self._clients:
+                return False
+            loop = getattr(self, "_loop", None)
+            if loop is None:
+                return False
+            loop.call_soon_threadsafe(
+                lambda: loop.create_task(
+                    self.broadcast({"type": "beep",
+                                    "for": max(1, min(int(seconds), 30))})))
+            return True
+        except Exception:
+            return False
 
     async def broadcast(self, msg: dict) -> None:
         self._history.append(msg)
@@ -817,6 +856,137 @@ class DashboardServer:
             except Exception as e:
                 return JSONResponse({"error": str(e)}, status_code=500)
 
+        # ── Presence lock (walk-away security) ─────────────────────────
+        # Off (0 minutes) unless the user opts in: locking someone's PC
+        # unprompted is not a default any feature gets to have.
+
+        @app.get("/api/presence")
+        async def presence_get(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                import json as _json
+                cfg_path = BASE_DIR / "config" / "api_keys.json"
+                mins = int((_json.loads(cfg_path.read_text(encoding="utf-8"))
+                            .get("presence_lock_minutes", 0) or 0))
+            except Exception:
+                mins = 0
+            return JSONResponse({"ok": True,
+                                 **self.device_presence(),
+                                 "lock_after_minutes": mins})
+
+        @app.post("/api/presence")
+        async def presence_set(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                import json as _json
+                body = await req.json()
+                mins = max(0, min(int(body.get("minutes", 0)), 240))
+                cfg_path = BASE_DIR / "config" / "api_keys.json"
+                cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+                cfg["presence_lock_minutes"] = mins
+                tmp = cfg_path.with_suffix(".tmp")
+                tmp.write_text(_json.dumps(cfg, indent=1), encoding="utf-8")
+                tmp.replace(cfg_path)
+                return JSONResponse({"ok": True,
+                                     "lock_after_minutes": mins})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        # ── Backup / restore ─────────────────────────────────────────
+
+        @app.get("/api/backups")
+        async def backups_list(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import backup as _bk
+                return JSONResponse({"ok": True, "backups": _bk.list_backups()})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/backup")
+        async def backup_now(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import backup as _bk
+                ok, msg = _bk.export()
+                if not ok:
+                    return JSONResponse({"error": msg}, status_code=500)
+                await self.broadcast({"type": "sys",
+                                      "text": f"💾 Backup written: {Path(msg).name}"})
+                return JSONResponse({"ok": True, "message": msg})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.get("/api/backup/download")
+        async def backup_download(token: str = ""):
+            tok = token.strip()
+            if not tok or tok not in self._tokens:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import backup as _bk
+                items = _bk.list_backups()
+                if not items:
+                    return JSONResponse({"error": "No backups yet"}, status_code=404)
+                path = _bk._BACKUP_DIR / items[0]["name"]
+                return FileResponse(str(path), filename=items[0]["name"],
+                                    media_type="application/zip")
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        if _UPLOAD_OK:
+            @app.post("/api/restore")
+            async def restore_ep(req: Request, file: UploadFile = FastAPIFile(...)):
+                if not _auth(req):
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+                try:
+                    from core import backup as _bk
+                    data = await file.read(51 * 1024 * 1024)
+                    ok, msg = _bk.restore(data)
+                    if not ok:
+                        return JSONResponse({"error": msg}, status_code=400)
+                    await self.broadcast({"type": "sys", "text": f"💾 {msg}"})
+                    return JSONResponse({"ok": True, "message": msg})
+                except Exception as e:
+                    return JSONResponse({"error": str(e)}, status_code=500)
+
+        # ── Checklists ─────────────────────────────────────────────
+
+        @app.get("/api/lists")
+        async def lists_ep(req: Request, name: str = ""):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import checklists as _cl
+                if name:
+                    return JSONResponse({"ok": True, "items": _cl.show(name)})
+                return JSONResponse({"ok": True, "lists": _cl.lists()})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/lists")
+        async def lists_add(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import checklists as _cl
+                body = await req.json()
+                mode = str(body.get("mode", "add"))
+                if mode == "check":
+                    msg = _cl.check(str(body.get("list", "")),
+                                    str(body.get("text", "")))
+                elif mode == "clear":
+                    msg = _cl.clear_done(str(body.get("list", "")))
+                else:
+                    msg = _cl.add(str(body.get("list", "")),
+                                  str(body.get("text", "")))
+                return JSONResponse({"ok": True, "message": msg})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
         # ── Plugin installer ─────────────────────────────────────────
         @app.post("/api/plugins/install")
         async def plugins_install(req: Request):
@@ -908,6 +1078,7 @@ class DashboardServer:
             self._token_keys[tok] = key
             self._aes_key(key)
             self._device_sessions[dev_tok] = {"session_key": key}
+            self._device_seen[dev_tok] = time.time()
 
             if self._connect_callback:
                 self._connect_callback()
@@ -943,6 +1114,7 @@ class DashboardServer:
             if not dev_tok or dev_tok not in self._device_sessions:
                 return JSONResponse({"ok": False}, status_code=401)
             session_key = self._device_sessions[dev_tok]["session_key"]
+            self._device_seen[dev_tok] = time.time()
             tok = secrets.token_urlsafe(32)
             self._tokens.add(tok)
             self._token_keys[tok] = session_key
@@ -978,6 +1150,7 @@ class DashboardServer:
                 text = (body.get("text") or "").strip()
             if text:
                 await self._command_queue.put(text)
+                self._touch_device(token)
                 if self._wake_callback:
                     self._wake_callback()
             return JSONResponse({"ok": True})
@@ -1019,6 +1192,8 @@ class DashboardServer:
                 dest.write_bytes(data)
                 await self._photo_queue.put({"path": str(dest),
                                              "question": question})
+                self._touch_device(req.headers.get("authorization", "")
+                                   .removeprefix("Bearer ").strip())
                 if self._wake_callback:
                     self._wake_callback()
                 return JSONResponse({"ok": True, "name": dest.name})
@@ -1042,6 +1217,7 @@ class DashboardServer:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
+            self._touch_device(tok)
             asyncio.create_task(self.broadcast(
                 {"type": "sys", "text": "Phone microphone live."}
             ))
@@ -1156,6 +1332,7 @@ class DashboardServer:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
+            self._touch_device(tok)
             self._clients.add(websocket)
             for entry in self._history[-50:]:
                 try:
@@ -1207,6 +1384,11 @@ class DashboardServer:
 
         # Generate the TLS pair on first run so no private key ships in the repo.
         _ensure_certs()
+
+        try:
+            self._loop = asyncio.get_running_loop()
+        except Exception:
+            pass
 
         # Live HUD metrics ticker (read-only feed for /hud).
         try:
