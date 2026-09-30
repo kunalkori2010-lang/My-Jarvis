@@ -42,6 +42,10 @@ memory/affect_state.json
 # and how long you had been quiet. Boring individually; a pattern of
 # availability, if you would rather it lived nowhere near a repo.
 memory/initiative_state.json
+# Routines are your personal schedules (wake-ups, briefings) — same rule.
+memory/routines.json
+# Conversation history is a record of what was actually said.
+memory/conversation_history.json
 # Belt and braces. An earlier build resolved the base directory without the
 # memory/ segment and dropped these in the repository root, where they are
 # perfectly visible to `git add .` and perfectly easy to miss in review. The

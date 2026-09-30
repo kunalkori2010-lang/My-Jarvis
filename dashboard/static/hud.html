@@ -208,6 +208,26 @@ body.speaking .pulse.d2{animation-delay:.55s}
 <div class="sched"><div class="sic">&lt;/&gt;</div><div><b>6:00 PM &nbsp; Project Deadline</b><br><small>Work</small></div><span class="pill">Work</span></div>
 <div class="sched" style="border:none"><div class="sic">👥</div><div><b>12:00 AM &nbsp; Team Meeting</b><br><small>Work</small></div><span class="pill">Work</span></div>
 </div>
+<div class="panel"><div class="p-title"><span>💬 RECENT CONVERSATIONS</span><span id="histState" style="font-size:10px;color:#5f8291">live</span></div>
+<div id="hist" style="display:flex;flex-direction:column;gap:10px;max-height:260px;overflow-y:auto">
+<div style="font-size:11px;color:#5f8291">Waiting for live feed…</div>
+</div>
+</div>
+<div class="panel"><div class="p-title"><span>⏱ AUTOMATIONS</span><span id="rtState" style="font-size:10px;color:#5f8291"></span></div>
+<div id="routines" style="display:flex;flex-direction:column;gap:8px">
+<div style="font-size:11px;color:#5f8291">Waiting for live feed…</div>
+</div>
+<div id="rtForm" style="display:none;margin-top:10px;flex-direction:column;gap:6px">
+<input id="rtName" placeholder="Name — e.g. Morning brief" style="background:rgba(2,12,26,.8);border:1px solid rgba(0,190,255,.3);border-radius:8px;color:#fff;padding:7px 9px;font-size:11px;outline:none">
+<div style="display:flex;gap:6px">
+<select id="rtKind" style="background:rgba(2,12,26,.8);border:1px solid rgba(0,190,255,.3);border-radius:8px;color:#fff;padding:7px;font-size:11px"><option value="daily">daily</option><option value="interval">interval</option><option value="once">once</option></select>
+<input id="rtWhen" placeholder="08:00 / 60 min / 2026-10-02T08:00" style="flex:1;background:rgba(2,12,26,.8);border:1px solid rgba(0,190,255,.3);border-radius:8px;color:#fff;padding:7px 9px;font-size:11px;outline:none">
+</div>
+<input id="rtCmd" placeholder="Command — e.g. brief me on the news" style="background:rgba(2,12,26,.8);border:1px solid rgba(0,190,255,.3);border-radius:8px;color:#fff;padding:7px 9px;font-size:11px;outline:none">
+<button id="rtAdd" style="background:rgba(0,150,255,.18);border:1px solid rgba(0,200,255,.5);border-radius:8px;color:#bff;padding:7px;font-size:11px;cursor:pointer">+ Add routine</button>
+</div>
+<div id="rtNote" style="font-size:10px;color:#5f8291;margin-top:6px">Pair this browser (open / once) to manage routines.</div>
+</div>
 </div>
 </div>
 <script>
@@ -222,11 +242,37 @@ requestAnimationFrame(wave);
 /* sparklines */
 function spark(id,base){const s=document.getElementById(id);let d='M0,12 ';for(let i=0;i<=30;i++){d+=`L${i*3},${(12+Math.sin(i*.7+base)*4+Math.random()*3).toFixed(1)} `}s.innerHTML=`<path d="${d}" fill="none" stroke="#00cfff" stroke-width="1.2"/>`}
 spark('sp1',1);spark('sp2',3);spark('sp3',5);setInterval(()=>{spark('sp1',Math.random()*6);spark('sp2',Math.random()*6);spark('sp3',Math.random()*6)},2500);
-/* metrics */
-let cpu=23,ram=46,gpu=18;
+/* metrics — live values win, simulation is only the offline fallback */
+let cpu=23,ram=46,gpu=18,liveFeed=false;
 function arc(id,v){document.getElementById(id).style.strokeDashoffset=(226*(1-v/100)).toFixed(0)}
-setInterval(()=>{if(window.JARVIS&&window.JARVIS.metrics)return;cpu=Math.min(92,Math.max(8,cpu+Math.random()*8-4));ram=Math.min(88,Math.max(28,ram+Math.random()*4-2));gpu=Math.min(95,Math.max(5,gpu+Math.random()*10-5));document.getElementById('cpuV').textContent=Math.round(cpu)+'%';document.getElementById('ramV').textContent=Math.round(ram)+'%';document.getElementById('gpuV').textContent=Math.round(gpu)+'%';arc('cpuArc',cpu);arc('ramArc',ram);arc('gpuArc',gpu);lvl=Math.min(1,cpu/130+.15)},2000);
-window.jarvisUpdate=function(m){if(m.cpu!=null){cpu=m.cpu;document.getElementById('cpuV').textContent=cpu+'%';arc('cpuArc',cpu)}if(m.ram!=null){ram=m.ram;document.getElementById('ramV').textContent=ram+'%';arc('ramArc',ram)}if(m.gpu!=null){gpu=m.gpu;document.getElementById('gpuV').textContent=gpu+'%';arc('gpuArc',gpu)}if(m.weather)document.getElementById('wxT').textContent=m.weather;if(m.status)document.getElementById('stTx').textContent=m.status;if(m.say)say(m.say)};
+function setCpu(v){cpu=v;document.getElementById('cpuV').textContent=Math.round(v)+'%';arc('cpuArc',v)}
+function setRam(v){ram=v;document.getElementById('ramV').textContent=Math.round(v)+'%';arc('ramArc',v)}
+setInterval(()=>{if(liveFeed||(window.JARVIS&&window.JARVIS.metrics))return;cpu=Math.min(92,Math.max(8,cpu+Math.random()*8-4));ram=Math.min(88,Math.max(28,ram+Math.random()*4-2));gpu=Math.min(95,Math.max(5,gpu+Math.random()*10-5));document.getElementById('cpuV').textContent=Math.round(cpu)+'%';document.getElementById('ramV').textContent=Math.round(ram)+'%';document.getElementById('gpuV').textContent=Math.round(gpu)+'%';arc('cpuArc',cpu);arc('ramArc',ram);arc('gpuArc',gpu);lvl=Math.min(1,cpu/130+.15)},2000);
+window.jarvisUpdate=function(m){if(m.cpu!=null)setCpu(m.cpu);if(m.ram!=null)setRam(m.ram);if(m.gpu!=null){gpu=m.gpu;document.getElementById('gpuV').textContent=gpu+'%';arc('gpuArc',gpu)}if(m.weather)document.getElementById('wxT').textContent=m.weather;if(m.status)document.getElementById('stTx').textContent=m.status;if(m.say)say(m.say)};
+/* live feed: read-only socket — metrics, state, conversation lines, history */
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function renderHist(turns){const box=document.getElementById('hist');if(!box)return;if(!turns||!turns.length){box.innerHTML='<div style="font-size:11px;color:#5f8291">No conversations yet.</div>';return}box.innerHTML=turns.slice(0,20).map(t=>{const u=esc(t.user),j=esc(t.jarvis),ts=esc(t.ts||'');return `<div style="border-bottom:1px solid rgba(255,255,255,.06);padding-bottom:8px"><div style="font-size:9px;color:#5f8291">${ts}</div>${u?`<div style="font-size:11px;margin-top:3px"><span style="color:#8fd8ff">You:</span> ${u}</div>`:''}${j?`<div style="font-size:11px;margin-top:2px"><span style="color:#5cf2ae">Jarvis:</span> ${j}</div>`:''}</div>`}).join('')}
+function schedText(s){s=s||{};if(s.kind==='daily')return 'daily '+esc(s.time||'');if(s.kind==='interval')return 'every '+esc(s.minutes||'?')+' min';if(s.kind==='once')return 'once '+esc(s.at||'');return esc(s.kind||'')}
+function renderRoutines(list){const box=document.getElementById('routines');if(!box)return;if(!list||!list.length){box.innerHTML='<div style="font-size:11px;color:#5f8291">No routines. Add one below — e.g. daily 08:00 → brief me.</div>';return}const tok=sessionStorage.getItem('jarvis_token');box.innerHTML=list.map(r=>{const on=r.enabled!==false;return `<div style="display:flex;align-items:center;gap:8px;border-bottom:1px solid rgba(255,255,255,.06);padding-bottom:7px"><div style="width:8px;height:8px;border-radius:50%;background:${on?'#5cf2ae':'#5f8291'};box-shadow:0 0 8px ${on?'#5cf2ae':'transparent'}"></div><div style="flex:1;min-width:0"><div style="font-size:11px">${esc(r.name)}</div><div style="font-size:9px;color:#5f8291">${schedText(r.schedule)} → ${esc((r.command||'').slice(0,60))}</div></div>${tok?`<button onclick="rtToggle('${esc(r.id)}',${on?'false':'true'})" style="background:transparent;border:1px solid rgba(0,200,255,.4);border-radius:6px;color:#8fd8ff;font-size:10px;padding:3px 8px;cursor:pointer">${on?'pause':'on'}</button><button onclick="rtDel('${esc(r.id)}')" style="background:transparent;border:1px solid rgba(255,100,100,.4);border-radius:6px;color:#ff8a8a;font-size:10px;padding:3px 8px;cursor:pointer">✕</button>`:''}</div>`}).join('')}
+function rtAuth(){const t=sessionStorage.getItem('jarvis_token');return t?{'Authorization':'Bearer '+t}:null}
+async function rtRefresh(){const h=rtAuth();if(!h)return;try{const r=await fetch('/api/routines',{headers:h});const j=await r.json();if(j.ok)renderRoutines(j.routines)}catch(e){}}
+async function rtDel(id){const h=rtAuth();if(!h)return;await fetch('/api/routines/'+encodeURIComponent(id),{method:'DELETE',headers:h});rtRefresh()}
+async function rtToggle(id,on){const h=rtAuth();if(!h)return;await fetch('/api/routines/'+encodeURIComponent(id)+'/toggle',{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify({enabled:on})});rtRefresh()}
+(function rtInit(){const tok=sessionStorage.getItem('jarvis_token');if(tok){document.getElementById('rtForm').style.display='flex';document.getElementById('rtNote').style.display='none';rtRefresh()}
+document.getElementById('rtAdd').onclick=async()=>{const h=rtAuth();if(!h)return;const kind=document.getElementById('rtKind').value,when=document.getElementById('rtWhen').value.trim(),sched=kind==='daily'?{kind,time:when}:kind==='interval'?{kind,minutes:parseInt(when,10)||0}:{kind,at:when};const body={name:document.getElementById('rtName').value.trim(),schedule:sched,command:document.getElementById('rtCmd').value.trim()};try{const r=await fetch('/api/routines',{method:'POST',headers:{...h,'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(j.ok){document.getElementById('rtName').value='';document.getElementById('rtCmd').value='';rtRefresh()}else{say(j.error||'Could not add routine')}}catch(e){say('Routine request failed')}};
+})();
+(function connectHud(){let proto=location.protocol==='https:'?'wss':'ws';let ws;try{ws=new WebSocket(`${proto}://${location.host}/ws/hud`)}catch(e){return}
+ws.onopen=()=>{const el=document.getElementById('histState');if(el){el.textContent='live';el.style.color='#5cf2ae'}};
+ws.onclose=()=>{liveFeed=false;const el=document.getElementById('histState');if(el){el.textContent='offline';el.style.color='#ff8a8a'}setTimeout(connectHud,5000)};
+ws.onerror=()=>{try{ws.close()}catch(e){}};
+ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch(err){return}
+if(m.type==='hud'){liveFeed=true;if(m.cpu!=null)setCpu(m.cpu);if(m.ram!=null)setRam(m.ram);lvl=Math.min(1,(cpu/130+.15));const st=document.getElementById('stTx');if(st&&m.state){st.textContent=m.state==='active'?'● Listening...':(m.state==='reconnecting'?`● Reconnecting (${m.attempt||''})…`:'● '+m.state)}}
+else if(m.type==='history'){renderHist(m.turns)}
+else if(m.type==='routines'){renderRoutines(m.routines)}
+else if(m.type==='log'){if(m.speaker==='jarvis'&&m.text){say(m.text);document.body.classList.add('speaking');setTimeout(()=>{if(!live)document.body.classList.remove('speaking')},2500)}else if(m.speaker==='user'&&m.text){say('You: '+m.text)}}
+else if(m.type==='status'&&m.state){const st=document.getElementById('stTx');if(st)st.textContent=m.state==='active'?'● Listening...':'● '+m.state}
+else if(m.type==='sys'&&m.text){say(m.text)}
+}})();
 /* voice */
 const vtxt=document.getElementById('vtxt'),mic=document.getElementById('mic');let tm=null;
 function say(t){clearInterval(tm);let i=0;tm=setInterval(()=>{vtxt.textContent=t.slice(0,++i);if(i>=t.length)clearInterval(tm)},16)}

@@ -475,6 +475,13 @@ class DashboardServer:
             self._hud_html = _read("hud.html")
         except Exception:
             self._hud_html = ""
+        # ── Live HUD feed (/hud + /ws/hud) ──────────────────────────────
+        # Read-only, no token: it carries metrics, connection state and the
+        # already-broadcast log lines — nothing that can command the
+        # assistant. Anything that acts still goes through the authed APIs.
+        self._hud_clients: set = set()
+        self._hud_state: dict = {"state": "starting"}
+        self._start_ts                    = time.time()
         self.app                          = self._build_app()
 
     # ── one-time key management ───────────────────────────────────────────
@@ -536,6 +543,66 @@ class DashboardServer:
             except Exception:
                 dead.add(ws)
         self._clients -= dead
+        # Mirror conversation lines + status to the read-only HUD feed so the
+        # /hud page speaks and pulses with the real session, not a simulation.
+        try:
+            if isinstance(msg, dict) and msg.get("type") in ("log", "status", "sys"):
+                await self._push_hud(msg)
+        except Exception:
+            pass
+
+    # ── Live HUD feed ────────────────────────────────────────────────────
+
+    def update_hud(self, **kw) -> None:
+        """Merge keys into the HUD snapshot and push it. Sync so main.py can
+        call it from anywhere; the socket writes happen on the event loop."""
+        try:
+            self._hud_state.update(kw)
+            self._hud_state["ts"] = time.time()
+        except Exception:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._push_hud({"type": "hud",
+                                             **self._hud_snapshot()}))
+        except Exception:
+            pass
+
+    def _hud_snapshot(self) -> dict:
+        snap = dict(self._hud_state)
+        try:
+            snap["uptime"] = int(time.time() - self._start_ts)
+            snap["sessions"] = len(self._clients)
+        except Exception:
+            pass
+        return snap
+
+    async def _push_hud(self, msg: dict) -> None:
+        dead: set = set()
+        for ws in list(self._hud_clients):
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead.add(ws)
+        self._hud_clients -= dead
+
+    async def _hud_ticker(self) -> None:
+        """Every 3 s: refresh system metrics into the HUD snapshot and push."""
+        while True:
+            try:
+                cpu = ram = 0.0
+                try:
+                    import psutil as _ps
+                    cpu = float(_ps.cpu_percent(interval=None))
+                    ram = float(_ps.virtual_memory().percent)
+                except Exception:
+                    pass
+                self._hud_state.update({"cpu": round(cpu, 1),
+                                        "ram": round(ram, 1)})
+                await self._push_hud({"type": "hud", **self._hud_snapshot()})
+            except Exception:
+                pass
+            await asyncio.sleep(3)
 
     # ── FastAPI app ───────────────────────────────────────────────────────
 
@@ -576,6 +643,140 @@ class DashboardServer:
             if self._hud_html:
                 return HTMLResponse(self._hud_html)
             return HTMLResponse("<h3>hud.html missing</h3>", status_code=404)
+
+        @app.websocket("/ws/hud")
+        async def hud_ws(websocket: WebSocket):
+            """Read-only live feed for the /hud page: snapshot + log/status
+            lines as they happen. No token — it can only watch, never act."""
+            await websocket.accept()
+            self._hud_clients.add(websocket)
+            try:
+                await websocket.send_json({"type": "hud",
+                                           **self._hud_snapshot()})
+                try:
+                    from memory import history as _hist
+                    await websocket.send_json({"type": "history",
+                                               "turns": _hist.recent(20)})
+                except Exception:
+                    pass
+                try:
+                    from core import routines as _rt
+                    await websocket.send_json({"type": "routines",
+                                               "routines": _rt.list_all()})
+                except Exception:
+                    pass
+                for entry in self._history[-20:]:
+                    try:
+                        if isinstance(entry, dict) and entry.get("type") in (
+                                "log", "status", "sys"):
+                            await websocket.send_json(entry)
+                    except Exception:
+                        break
+                while True:
+                    try:
+                        await websocket.receive_text()
+                    except Exception:
+                        break
+            finally:
+                self._hud_clients.discard(websocket)
+
+        @app.get("/api/history")
+        async def history_ep(req: Request, n: int = 20, q: str = ""):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from memory import history as _hist
+                turns = _hist.search(q, n) if q else _hist.recent(n)
+                return JSONResponse({"ok": True, "turns": turns})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        # ── Routines (user automations) ──────────────────────────────────
+
+        @app.get("/api/routines")
+        async def routines_list(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import routines as _rt
+                return JSONResponse({"ok": True, "routines": _rt.list_all()})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/routines")
+        async def routines_add(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import routines as _rt
+                body = await req.json()
+                r = _rt.add(str(body.get("name", "")),
+                            body.get("schedule") or {},
+                            str(body.get("command", "")))
+                if "error" in r:
+                    return JSONResponse({"error": r["error"]}, status_code=400)
+                await self.broadcast({"type": "sys",
+                                      "text": f"Routine added: {r['name']}"})
+                return JSONResponse({"ok": True, "routine": r})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.delete("/api/routines/{rid}")
+        async def routines_del(req: Request, rid: str):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import routines as _rt
+                if not _rt.remove(rid.strip()):
+                    return JSONResponse({"error": "Not found"}, status_code=404)
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/routines/{rid}/toggle")
+        async def routines_toggle(req: Request, rid: str):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import routines as _rt
+                body = await req.json()
+                if not _rt.set_enabled(rid.strip(),
+                                       bool(body.get("enabled", True))):
+                    return JSONResponse({"error": "Not found"}, status_code=404)
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        # ── Audio self-test (first-run wizard helper) ────────────────────
+        # Never opens a stream — the live session owns the devices — so it is
+        # always safe to call, even mid-conversation. It answers the three
+        # questions every "can't hear me / can't hear it" report starts with:
+        # what is configured, what actually exists, and do they match.
+
+        @app.get("/api/audio-test")
+        async def audio_test(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import audio_devices as _ad
+                from memory import config_manager as _cm
+                want_in = _cm.get_input_device()
+                want_out = _cm.get_output_device()
+                ins = _ad.list_devices("input")
+                outs = _ad.list_devices("output")
+                in_ok = _ad.resolve(want_in, "input") is not None or not ins
+                out_ok = _ad.resolve(want_out, "output") is not None or not outs
+                return JSONResponse({
+                    "ok": True,
+                    "configured": {"input": want_in, "output": want_out},
+                    "available": {"inputs": ins, "outputs": outs},
+                    "match": {"input": bool(in_ok), "output": bool(out_ok)},
+                    "hint": ("All good." if (in_ok and out_ok)
+                             else "Open JARVIS ⚙ → Audio Devices and re-pick "
+                                  "the missing device."),
+                })
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
 
         @app.post("/login")
         async def login(req: Request):
@@ -877,6 +1078,12 @@ class DashboardServer:
 
         # Generate the TLS pair on first run so no private key ships in the repo.
         _ensure_certs()
+
+        # Live HUD metrics ticker (read-only feed for /hud).
+        try:
+            asyncio.get_event_loop().create_task(self._hud_ticker())
+        except Exception:
+            pass
 
         use_ssl  = self._ssl_enabled()
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"

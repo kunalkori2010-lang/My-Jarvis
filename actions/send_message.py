@@ -5,6 +5,11 @@ import time
 from pathlib import Path
 
 try:
+    from core import confirm as _confirm
+except Exception:
+    _confirm = None
+
+try:
     import pyautogui
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.06
@@ -230,6 +235,22 @@ def _resolve_platform(platform_str: str):
     return lambda r, m: _desktop_send(platform_str.strip().title(), r, m)
 
 
+def _execute_send(handler, receiver: str, message_text: str,
+                  platform: str, player=None) -> str:
+    """Run the actual send on the confirm worker thread after acceptance."""
+    try:
+        result = handler(receiver, message_text)
+    except Exception as e:
+        result = f"Could not send message: {e}"
+    print(f"[SendMessage] {'✅' if 'sent' in result.lower() else '❌'} {result}")
+    if player:
+        try:
+            player.write_log(f"[msg] {result}")
+        except Exception:
+            pass
+    return result
+
+
 def send_message(
     parameters: dict,
     response=None,
@@ -253,9 +274,24 @@ def send_message(
     if player:
         player.write_log(f"[msg] {platform} → {receiver}")
 
+    # ── The gate ─────────────────────────────────────────────────────────
+    # A sent message cannot be unsent, so like shutdown/restart it waits for
+    # the human to press CONFIRM on screen. The actual send runs on the
+    # confirm worker thread after acceptance — never on the model's word.
+    handler = _resolve_platform(platform)
+    if _confirm is not None:
+        if _confirm.pending_title():
+            return ("There is already a confirmation waiting on screen. "
+                    "Ask the user to answer that one first.")
+        return _confirm.request(
+            key="send_message", title="Send message",
+            detail=f"{platform.title()} → {receiver}: {preview}",
+            run=lambda: _execute_send(handler, receiver, message_text,
+                                      platform, player),
+        )
+
     try:
-        handler = _resolve_platform(platform)
-        result  = handler(receiver, message_text)
+        result = handler(receiver, message_text)
     except Exception as e:
         result = f"Could not send message: {e}"
 
@@ -269,7 +305,7 @@ def send_message(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "send_message",
-    "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
+    "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform. Sending is irreversible: it puts a CONFIRM banner on screen and only sends after the user presses it — never claim it is sent before that.",
     "parameters": {
         "type": "OBJECT",
         "properties": {

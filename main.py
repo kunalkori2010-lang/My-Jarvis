@@ -32,6 +32,40 @@ import sys as _sys
 # autostart working and the app silently never appearing. Point the streams at a
 # real file instead, which also means a failed boot leaves a diagnosable trace.
 _LOG_PATH = None
+# ── Log rotation ──────────────────────────────────────────────────────────
+# A single QueueFull storm once grew jarvis.log to ~4 MB of identical
+# tracebacks in one session. Rotate past 2 MB, keep 3 backups, so the log can
+# never eat the disk no matter what floods it next.
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+_LOG_BACKUPS = 3
+
+
+def _rotate_logs(log_dir, base_name: str = "jarvis.log") -> None:
+    try:
+        from pathlib import Path as _RP
+        cur = _RP(log_dir) / base_name
+        if not cur.exists() or cur.stat().st_size <= _LOG_MAX_BYTES:
+            return
+        for i in range(_LOG_BACKUPS - 1, 0, -1):
+            src, dst = cur.parent / f"{base_name}.{i}", cur.parent / f"{base_name}.{i + 1}"
+            if src.exists():
+                try:
+                    if dst.exists():
+                        dst.unlink()
+                    src.rename(dst)
+                except Exception:
+                    pass
+        try:
+            first = cur.parent / f"{base_name}.1"
+            if first.exists():
+                first.unlink()
+            cur.rename(first)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 try:
     _MISSING = [s for s in ("stdout", "stderr")
                 if getattr(_sys, s, None) is None]
@@ -40,6 +74,7 @@ try:
         _logs = _P(__file__).resolve().parent / "logs"
         _logs.mkdir(parents=True, exist_ok=True)
         _LOG_PATH = _logs / "jarvis.log"
+        _rotate_logs(_logs)
         _fh = open(_LOG_PATH, "a", encoding="utf-8", errors="replace",
                    buffering=1)
         for _s in _MISSING:
@@ -1884,6 +1919,19 @@ class JarvisLive:
                                     }))
                             out_buf = []
 
+                            # ── Conversation history ─────────────────────
+                            # One row per exchange, written off-thread: the
+                            # history panel (/hud + /api/history) reads this
+                            # file, so the conversation finally survives the
+                            # session it happened in.
+                            if full_in or full_out:
+                                try:
+                                    from memory import history as _hist
+                                    asyncio.create_task(asyncio.to_thread(
+                                        _hist.append_turn, full_in, full_out))
+                                except Exception:
+                                    pass
+
                             if self._vision_close_pending:
                                 # This turn_complete IS the vision answer — close camera + release busy flag
                                 self._vision_close_pending = False
@@ -2042,13 +2090,51 @@ class JarvisLive:
                     await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
+                except Exception as _we:
+                    # A speaker that dies mid-session (unplugged headset, MME
+                    # "no driver" error 6, exclusive-mode grab) must NEVER take
+                    # the session down with it — that is exactly the 1006
+                    # cascade in the old logs. Drop this batch, try the default
+                    # device no more than once every 5 s, and keep listening:
+                    # the user can still type, and the mouth still moves.
+                    _now = time.monotonic()
+                    print(f"[JARVIS] ⚠️ Output write failed ({_we}) — dropping audio")
+                    if _now - getattr(self, "_spk_retry_at", 0.0) >= 5.0:
+                        self._spk_retry_at = _now
+                        try:
+                            try:
+                                stream.stop()
+                            except Exception:
+                                pass
+                            try:
+                                stream.close()
+                            except Exception:
+                                pass
+                            stream = _open_spk(None)
+                            self.ui.write_log("SYS: Speaker failed — recovered on default device.")
+                            print("[JARVIS] 🔊 Speaker recovered on default device.")
+                        except Exception as _re:
+                            self.ui.write_log(
+                                "SYS: Speaker unavailable — voice muted, but I'm still "
+                                "listening and you can type. (Check ⚙ → Audio Devices)")
+                            print(f"[JARVIS] 🔊 Speaker still down ({_re}) — muted, listening on.")
+                            await asyncio.sleep(0.5)
+                    continue
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
@@ -2378,6 +2464,42 @@ class JarvisLive:
                         print(f"[Monitor] ⚠️ Background check error: {e}")
             await asyncio.sleep(1800)     # check every 30 minutes
 
+    async def _run_routines(self) -> None:
+        """Fire user-defined routines (core/routines.py) once a minute.
+
+        Routines are explicit instructions, not suggestions: they ignore the
+        initiative budget and dismissal learning. They still respect sleep,
+        mute, an active reply, and a recent conversation — a routine that
+        talks over the user is a bug, not a feature.
+        """
+        await asyncio.sleep(60)           # let the session settle first
+        while True:
+            try:
+                if self.session and self._awake and not self.ui.muted:
+                    with self._speaking_lock:
+                        speaking = self._is_speaking
+                    recent = (time.monotonic() - self._last_user_speech) < 30
+                    if not speaking and not recent:
+                        from core import routines as _rt
+                        for r in await asyncio.to_thread(_rt.due):
+                            try:
+                                await self.session.send_client_content(
+                                    turns={"role": "user", "parts": [{
+                                        "text": (
+                                            f"[ROUTINE: {r.get('name')}] "
+                                            f"{r.get('command')}")}]},
+                                    turn_complete=True,
+                                )
+                                self.ui.write_log(
+                                    f"SYS: Routine fired — {r.get('name')}")
+                                print(f"[Routines] fired: {r.get('name')}")
+                                await asyncio.sleep(6)
+                            except Exception as e:
+                                print(f"[Routines] ⚠️ fire error: {e}")
+            except Exception as e:
+                print(f"[Routines] ⚠️ loop error: {e}")
+            await asyncio.sleep(60)
+
     async def _warm_embeddings(self) -> None:
         """Load the local embedding model in the background at startup.
 
@@ -2610,6 +2732,12 @@ class JarvisLive:
                     self._interrupted          = False
 
                     print("[JARVIS] Connected.")
+                    self._conn_attempts = 0   # clean connect resets the UX counter
+                    try:
+                        if self._dashboard:
+                            self._dashboard.update_hud(state="active")
+                    except Exception:
+                        pass
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
                         # and "it reconnected and still knows what we were doing"
@@ -2639,6 +2767,7 @@ class JarvisLive:
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
+                    tg.create_task(self._run_routines())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
                     tg.create_task(self._warm_embeddings())
@@ -2796,8 +2925,28 @@ class JarvisLive:
             if self._dashboard:
                 await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
 
+            # ── Reconnect UX ───────────────────────────────────────────────
+            # attempt counter survives across loop passes: first drop says
+            # "Reconnecting…", a stubborn outage escalates to attempt counts
+            # and a hint, instead of repeating the same line forever.
+            _attempts = getattr(self, "_conn_attempts", 0) + 1
+            self._conn_attempts = _attempts
             delay = getattr(self, "_conn_backoff", 3)
-            print(f"[JARVIS] Reconnecting in {delay}s...")
+            if _attempts <= 1:
+                self.ui.write_log("SYS: Connection lost — reconnecting…")
+            else:
+                self.ui.write_log(
+                    f"SYS: Reconnecting (attempt {_attempts}, retry in {delay}s)…")
+            if self._dashboard:
+                await self._dashboard.broadcast(
+                    {"type": "status", "state": "reconnecting",
+                     "attempt": _attempts})
+                try:
+                    self._dashboard.update_hud(state="reconnecting",
+                                               attempt=_attempts)
+                except Exception:
+                    pass
+            print(f"[JARVIS] Reconnecting in {delay}s (attempt {_attempts})...")
             await asyncio.sleep(delay)
 
 def main():
