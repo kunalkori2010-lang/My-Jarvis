@@ -23,7 +23,7 @@ from pathlib import Path
 _BASE = Path(__file__).resolve().parent.parent
 _URL = "http://localhost:11434"
 _TIMEOUT_PROBE = 2.0
-_TIMEOUT_CHAT = 60.0
+_TIMEOUT_CHAT = 180.0   # CPU inference on first load can exceed a minute
 
 _cached_ok: bool | None = None
 
