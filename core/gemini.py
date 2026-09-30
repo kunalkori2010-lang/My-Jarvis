@@ -364,7 +364,14 @@ def _live_call(contents, config, timeout_ms: int, key: str):
     if "error" in box:
         raise box["error"]
     text = box.get("text")
-    return _Reply(text) if text else None
+    if text:
+        try:
+            from core import usage as _usage
+            _usage.record(LIVE, len(str(contents or "")), len(str(text)))
+        except Exception:
+            pass
+        return _Reply(text)
+    return None
 
 
 def call(contents, tier: str = FAST, config=None,
@@ -405,7 +412,15 @@ def call(contents, tier: str = FAST, config=None,
             kwargs = {"model": model, "contents": contents}
             if config is not None:
                 kwargs["config"] = config
-            return cl.models.generate_content(**kwargs)
+            resp = cl.models.generate_content(**kwargs)
+            try:
+                from core import usage as _usage
+                _usage.record(tier,
+                              len(str(contents or "")),
+                              len(str(getattr(resp, "text", "") or "")))
+            except Exception:
+                pass
+            return resp
         except Exception as e:
             msg = str(e)
             if "429" in msg or "RESOURCE_EXHAUSTED" in msg:

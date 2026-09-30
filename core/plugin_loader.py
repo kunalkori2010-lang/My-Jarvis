@@ -46,6 +46,7 @@ class PluginRecord:
     settings: Optional[dict] = None   # optional PLUGIN_SETTINGS schema (config fields)
     behavior: Optional[str] = None    # None = the API's default (blocking)
     scheduling: Optional[str] = None  # None = the API's default (WHEN_IDLE)
+    meta: Optional[dict] = None       # optional PLUGIN_META {version, author, url}
 
 
 class PluginRegistry:
@@ -135,6 +136,7 @@ class PluginRegistry:
                 "valid": rec.valid,
                 "error": rec.error,
                 "enabled": get_plugin_enabled(rec.name) if rec.valid else False,
+                "meta": getattr(rec, "meta", None) or {},
             })
         return out
 
@@ -180,8 +182,15 @@ def _validate(module, filename: str) -> PluginRecord:
         return PluginRecord(name=name, file=filename,
                              error="Missing callable run(parameters, ...) function.")
 
-    # Optional, self-describing settings schema (rendered by the settings UI).
-    # A malformed schema is ignored, never fatal — the plugin still loads.
+    # Optional marketplace metadata: PLUGIN_META = {"version": "1.0",
+    # "author": "...", "url": "..."}. Malformed metadata is ignored, like the
+    # settings schema — it must never block a working plugin.
+    meta = getattr(module, "PLUGIN_META", None)
+    if not isinstance(meta, dict):
+        meta = None
+    else:
+        meta = {k: str(v)[:200] for k, v in meta.items()
+                if k in ("version", "author", "url")}
     settings = getattr(module, "PLUGIN_SETTINGS", None)
     if not (isinstance(settings, dict) and isinstance(settings.get("fields"), list)):
         settings = None
@@ -189,7 +198,8 @@ def _validate(module, filename: str) -> PluginRecord:
     return PluginRecord(name=name, description=description.strip(), parameters=parameters,
                          run=run_fn, file=filename, valid=True, error="", settings=settings,
                          behavior=_opt_upper(plugin_meta.get("behavior"), _BEHAVIORS),
-                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING))
+                         scheduling=_opt_upper(plugin_meta.get("scheduling"), _SCHEDULING),
+                         meta=meta)
 
 
 def _load_error(path: Path, plugins_dir: Path, exc: Exception) -> str:
@@ -283,3 +293,68 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
     if rejected:
         notify(f"{rejected} plugin(s) could not be loaded — see the console.")
     return registry
+
+
+# ── Install from URL ──────────────────────────────────────────────────────
+
+_FILENAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}\.py$")
+
+
+def install_from_url(url: str, plugins_dir=None) -> tuple[bool, str]:
+    """Download one .py file into plugins/ after validating it.
+
+    This is the whole "marketplace": paste a raw GitHub URL, and the file is
+    fetched, checked (right shape, safe filename, real PLUGIN + run), and put
+    in place. It takes effect on next launch — discovery runs once at
+    startup by design, and hot-reloading imports mid-conversation is how you
+    get two versions of the same tool answering at once.
+
+    Returns (True, "installed '<name>' — restart JARVIS to use it.") or
+    (False, reason). Never raises.
+    """
+    try:
+        import urllib.request
+        url = (url or "").strip()
+        if not (url.startswith("https://") or url.startswith("http://")):
+            return False, "Only http(s) URLs are accepted."
+        name = url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if not _FILENAME_RE.match(name) or name.startswith("_"):
+            return False, (f"'{name}' is not a valid plugin filename "
+                           "(letters/digits/underscore, .py, no leading _).")
+        dest_dir = Path(plugins_dir) if plugins_dir else Path(__file__).resolve().parent.parent / "plugins"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "JARVIS-plugin-installer"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if r.status != 200:
+                    return False, f"Download failed (HTTP {r.status})."
+                code = r.read()
+            if len(code) > 512 * 1024:
+                return False, "File too large (max 512 KB for a plugin)."
+            text = code.decode("utf-8")
+        except Exception as e:
+            return False, f"Download failed: {e}"
+        # Validate BEFORE it lands in plugins/: compile + run the same
+        # _validate() discovery uses, from an isolated temp module.
+        try:
+            tmp_mod = f"_jarvis_install_check_{name[:-3]}"
+            spec = importlib.util.spec_from_loader(tmp_mod, loader=None)
+            module = importlib.util.module_from_spec(spec)
+            exec(compile(text, name, "exec"), module.__dict__)
+            rec = _validate(module, name)
+        except Exception as e:
+            return False, f"Not a valid plugin: {e}"
+        if not rec.valid:
+            return False, f"Not a valid plugin: {rec.error}"
+        dest = dest_dir / name
+        if dest.exists():
+            return False, (f"'{name}' already exists. Delete it from plugins/ "
+                           "first if you mean to replace it.")
+        try:
+            dest.write_text(text, encoding="utf-8")
+        except Exception as e:
+            return False, f"Could not write plugins/{name}: {e}"
+        return True, (f"Installed '{rec.name}' ({name})"
+                      + (f" v{rec.meta['version']}" if rec.meta and rec.meta.get("version") else "")
+                      + " — restart JARVIS to use it.")
+    except Exception as e:
+        return False, f"Install failed: {e}"

@@ -677,6 +677,12 @@ class JarvisLive:
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
+        # ── Offline fallback ─────────────────────────────────────────
+        # Voice needs the network, but text does not have to. After a streak
+        # of failed connects with a local Ollama present, the assistant
+        # answers typed/dashboard messages locally until Live returns.
+        self._offline       = False
+        self._offline_fails = 0
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         # No ProactiveEngine here any more. It used to own the trigger, the
         # cooldown and a rotating list of three subjects; core/initiative.py owns
@@ -1052,7 +1058,14 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
+            return
+        # Offline text mode: no session, but the local brain can still answer.
+        if not self.session:
+            if self._offline:
+                self._note_user_speech(text)
+                asyncio.run_coroutine_threadsafe(
+                    self._reply_offline(text), self._loop)
             return
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
@@ -1074,6 +1087,31 @@ class JarvisLive:
             ),
             self._loop
         )
+
+    async def _reply_offline(self, text: str) -> None:
+        """Answer one message with the local model (offline mode only)."""
+        from datetime import datetime as _dt
+        text = (text or "").strip()
+        if not text:
+            return
+        self.ui.write_log(f"You: {text}")
+        try:
+            from core import offline as _off
+            reply = await asyncio.to_thread(_off.chat, text)
+        except Exception:
+            reply = None
+        reply = reply or "I'm offline and my local brain didn't answer. Try again."
+        self.ui.write_log(f"{self._asst_name} (offline): {reply}")
+        if self._dashboard:
+            try:
+                await self._dashboard.broadcast({
+                    "type": "log", "speaker": "user", "text": text,
+                    "ts": _dt.now().isoformat()})
+                await self._dashboard.broadcast({
+                    "type": "log", "speaker": "jarvis", "text": reply,
+                    "ts": _dt.now().isoformat()})
+            except Exception:
+                pass
 
     def _note_user_speech(self, text: str) -> None:
         """Feed one user message to the affect and initiative observers.
@@ -2454,6 +2492,15 @@ class JarvisLive:
                                 turns={"role": "user", "parts": [{"text": msg}]},
                                 turn_complete=True,
                             )
+                            # The phone is a second brain, not a second-class
+                            # one: monitoring alerts surface there too.
+                            if self._dashboard:
+                                try:
+                                    await self._dashboard.broadcast({
+                                        "type": "sys", "text": f"👁 {alert}",
+                                    })
+                                except Exception:
+                                    pass
                             # Counted as initiative so it lands in the same daily
                             # budget as everything else, and so a second batch of
                             # headlines for the same topic is deduped.
@@ -2493,12 +2540,48 @@ class JarvisLive:
                                 self.ui.write_log(
                                     f"SYS: Routine fired — {r.get('name')}")
                                 print(f"[Routines] fired: {r.get('name')}")
+                                if self._dashboard:
+                                    try:
+                                        await self._dashboard.broadcast({
+                                            "type": "sys",
+                                            "text": f"⏱ Routine: {r.get('name')}",
+                                        })
+                                    except Exception:
+                                        pass
                                 await asyncio.sleep(6)
                             except Exception as e:
                                 print(f"[Routines] ⚠️ fire error: {e}")
             except Exception as e:
                 print(f"[Routines] ⚠️ loop error: {e}")
             await asyncio.sleep(60)
+
+    async def _run_consolidation(self) -> None:
+        """Once a day, file the conversation's durable facts for approval.
+
+        Staged — never auto-remembered. The user approves from the dashboard
+        (/api/staged); the activity log says how many are waiting.
+        """
+        await asyncio.sleep(600)          # let the first session breathe
+        while True:
+            try:
+                from core import consolidate as _cs
+                res = await asyncio.to_thread(_cs.run_once)
+                if res.get("staged"):
+                    n = res["staged"]
+                    self.ui.write_log(
+                        f"SYS: Filed {n} memor{'y' if n == 1 else 'ies'} for "
+                        "review — approve in the dashboard.")
+                    print(f"[Consolidate] staged {n}.")
+                    if self._dashboard:
+                        try:
+                            await self._dashboard.broadcast({
+                                "type": "sys",
+                                "text": f"🧠 {n} new memor{'y' if n == 1 else 'ies'} to review."})
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[Consolidate] ⚠️ loop error: {e}")
+            await asyncio.sleep(6 * 3600)  # re-check every 6 h (runs ~daily)
 
     async def _warm_embeddings(self) -> None:
         """Load the local embedding model in the background at startup.
@@ -2628,6 +2711,52 @@ class JarvisLive:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
         self.ui.notify_phone_connected()
 
+    # ── Phone photo as vision ────────────────────────────────────────────
+
+    async def _process_dashboard_photos(self) -> None:
+        """Inject phone-camera photos into the Live session as vision frames,
+        labelled with their source like every other capture."""
+        import base64 as _b64
+        _mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".png": "image/png", ".webp": "image/webp",
+                 ".gif": "image/gif", ".bmp": "image/bmp"}
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    self._dashboard._photo_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                print(f"[Dashboard] Photo queue error: {e}")
+                await asyncio.sleep(0.5)
+                continue
+            try:
+                for _ in range(80):
+                    if self.session:
+                        break
+                    await asyncio.sleep(0.1)
+                if not self.session:
+                    print("[Dashboard] Dropped photo (no session).")
+                    continue
+                if self._wake_enabled and not self._awake:
+                    self.wake(reason="phone photo")
+                path = Path(item.get("path", ""))
+                question = item.get("question") or "What do you see here?"
+                img_b = await asyncio.to_thread(path.read_bytes)
+                mime_t = _mime.get(path.suffix.lower(), "image/jpeg")
+                b64 = _b64.b64encode(img_b).decode("ascii")
+                print(f"[Vision] 📤 phone photo {len(img_b):,} bytes → main session")
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [
+                        {"inline_data": {"mime_type": mime_t, "data": b64}},
+                        {"text": "[IMAGE SOURCE: PHONE CAMERA]\n\n" + question},
+                    ]},
+                    turn_complete=True,
+                )
+                self.ui.write_log(f"[Web]: 📷 {path.name}")
+            except Exception as e:
+                print(f"[Dashboard] Photo inject error: {e}")
+
     # ── dashboard command relay ─────────────────────────────────────────────
 
     async def _process_dashboard_commands(self) -> None:
@@ -2653,6 +2782,10 @@ class JarvisLive:
                         turn_complete=True,
                     )
                     self.ui.write_log(f"[Web]: {text}")
+                elif self._offline:
+                    # No session, but the phone still deserves an answer.
+                    self.ui.write_log(f"[Web]: {text}")
+                    await self._reply_offline(text)
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:
@@ -2695,6 +2828,7 @@ class JarvisLive:
             asyncio.create_task(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
+            asyncio.create_task(self._process_dashboard_photos())
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
@@ -2733,6 +2867,17 @@ class JarvisLive:
 
                     print("[JARVIS] Connected.")
                     self._conn_attempts = 0   # clean connect resets the UX counter
+                    self._offline_fails = 0
+                    if self._offline:
+                        # The backup brain hands back over — say so plainly,
+                        # or the offline replies look like a different person.
+                        self._offline = False
+                        self.ui.write_log("SYS: Back online — voice restored.")
+                        print("[JARVIS] Back online, offline mode off.")
+                        if self._dashboard:
+                            self._dashboard.update_hud(state="active")
+                            await self._dashboard.broadcast(
+                                {"type": "status", "state": "active"})
                     try:
                         if self._dashboard:
                             self._dashboard.update_hud(state="active")
@@ -2768,6 +2913,7 @@ class JarvisLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_routines())
+                    tg.create_task(self._run_consolidation())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
                     tg.create_task(self._warm_embeddings())
@@ -2931,6 +3077,28 @@ class JarvisLive:
             # and a hint, instead of repeating the same line forever.
             _attempts = getattr(self, "_conn_attempts", 0) + 1
             self._conn_attempts = _attempts
+            # ── Offline fallback ─────────────────────────────────────
+            # Three failed connects in a row with a local model present:
+            # stop going silent and answer text locally until Live returns.
+            # The retry loop below keeps running either way, so coming back
+            # is automatic — nothing here can trap the assistant offline.
+            self._offline_fails = getattr(self, "_offline_fails", 0) + 1
+            if not self._offline and self._offline_fails >= 3:
+                try:
+                    from core import offline as _off
+                    if _off.refresh():
+                        self._offline = True
+                        self.ui.set_state("OFFLINE")
+                        self.ui.write_log(
+                            "SYS: Offline mode — no network, answering text "
+                            "locally. Voice returns when the connection does.")
+                        print("[JARVIS] Offline mode on (local brain).")
+                        if self._dashboard:
+                            self._dashboard.update_hud(state="offline")
+                            await self._dashboard.broadcast(
+                                {"type": "status", "state": "offline"})
+                except Exception:
+                    pass
             delay = getattr(self, "_conn_backoff", 3)
             if _attempts <= 1:
                 self.ui.write_log("SYS: Connection lost — reconnecting…")

@@ -463,6 +463,7 @@ class DashboardServer:
         self._clients: set[WebSocket]     = set()
         self._history: list[dict]         = []
         self._command_queue               = asyncio.Queue()
+        self._photo_queue                 = asyncio.Queue()   # phone photos for vision
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
@@ -585,6 +586,16 @@ class DashboardServer:
             except Exception:
                 dead.add(ws)
         self._hud_clients -= dead
+        # Phone clients are authenticated, so they also get the live snapshot:
+        # the phone becomes a second HUD, not just a remote keyboard.
+        if isinstance(msg, dict) and msg.get("type") == "hud":
+            dead_p: set[WebSocket] = set()
+            for ws in list(self._clients):
+                try:
+                    await ws.send_json(msg)
+                except Exception:
+                    dead_p.add(ws)
+            self._clients -= dead_p
 
     async def _hud_ticker(self) -> None:
         """Every 3 s: refresh system metrics into the HUD snapshot and push."""
@@ -747,6 +758,81 @@ class DashboardServer:
             except Exception as e:
                 return JSONResponse({"error": str(e)}, status_code=500)
 
+        # ── Usage ledger ───────────────────────────────────────────────
+        @app.get("/api/usage")
+        async def usage_ep(req: Request, days: int = 7):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import usage as _usage
+                return JSONResponse(_usage.summary(days))
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        # ── Staged facts (memory consolidation inbox) ────────────────
+
+        @app.get("/api/staged")
+        async def staged_list(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import consolidate as _cs
+                return JSONResponse({"ok": True, "facts": _cs.list_staged()})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/staged/{fid}/approve")
+        async def staged_approve(req: Request, fid: str):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import consolidate as _cs
+                ok, msg = _cs.approve(fid.strip())
+                if not ok:
+                    return JSONResponse({"error": msg}, status_code=404)
+                return JSONResponse({"ok": True, "message": msg})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/staged/{fid}/reject")
+        async def staged_reject(req: Request, fid: str):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import consolidate as _cs
+                ok, msg = _cs.reject(fid.strip())
+                if not ok:
+                    return JSONResponse({"error": msg}, status_code=404)
+                return JSONResponse({"ok": True, "message": msg})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/consolidate")
+        async def consolidate_now(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import consolidate as _cs
+                return JSONResponse({"ok": True, **_cs.run_once()})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        # ── Plugin installer ─────────────────────────────────────────
+        @app.post("/api/plugins/install")
+        async def plugins_install(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                from core import plugin_loader as _pl
+                body = await req.json()
+                ok, msg = _pl.install_from_url(str(body.get("url", "")))
+                if ok:
+                    await self.broadcast({"type": "sys", "text": msg})
+                    return JSONResponse({"ok": True, "message": msg})
+                return JSONResponse({"error": msg}, status_code=400)
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
         # ── Audio self-test (first-run wizard helper) ────────────────────
         # Never opens a stream — the live session owns the devices — so it is
         # always safe to call, even mid-conversation. It answers the three
@@ -895,6 +981,49 @@ class DashboardServer:
                 if self._wake_callback:
                     self._wake_callback()
             return JSONResponse({"ok": True})
+
+        # ── Phone photo as vision ──────────────────────────────────────
+        # The phone camera becomes another eye: the picture is queued and the
+        # main loop injects it into the Live session like a screen capture,
+        # labelled with its source. Authed — a photo is a command.
+
+        @app.post("/api/photo")
+        async def photo_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if not _UPLOAD_OK:
+                return JSONResponse(
+                    {"error": "Photo upload requires: pip install python-multipart"},
+                    status_code=503)
+            try:
+                form = await req.form()
+                up = form.get("photo")
+                question = str(form.get("question", "") or "").strip() or \
+                    "What do you see in this photo from my phone?"
+                if up is None or not hasattr(up, "read"):
+                    return JSONResponse({"error": "No photo attached"},
+                                        status_code=400)
+                data = await up.read()
+                if not data or len(data) > 10 * 1024 * 1024:
+                    return JSONResponse({"error": "Photo empty or over 10 MB"},
+                                        status_code=400)
+                fname = _safe_filename(getattr(up, "filename", "") or "phone.jpg")
+                if "." not in fname:
+                    fname += ".jpg"
+                dest = self._uploads_dir / fname
+                stem, suffix = Path(fname).stem, Path(fname).suffix
+                counter = 1
+                while dest.exists():
+                    dest = self._uploads_dir / f"{stem}_{counter}{suffix}"
+                    counter += 1
+                dest.write_bytes(data)
+                await self._photo_queue.put({"path": str(dest),
+                                             "question": question})
+                if self._wake_callback:
+                    self._wake_callback()
+                return JSONResponse({"ok": True, "name": dest.name})
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
 
         @app.post("/api/wake")
         async def wake_ep(req: Request):

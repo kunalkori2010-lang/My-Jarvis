@@ -82,6 +82,16 @@ def test_dashboard_routes():
     from dashboard.server import DashboardServer
     srv = DashboardServer()
     paths = {r.path for r in srv.app.routes}
-    for p in ("/", "/hud", "/ws/hud", "/api/history", "/api/routines",
-              "/api/audio-test", "/api/command"):
+    for p in ("/", "/hud", "/ws", "/ws/hud", "/ws/phone-audio",
+              "/api/history", "/api/routines", "/api/usage",
+              "/api/audio-test", "/api/staged", "/api/consolidate",
+              "/api/plugins/install", "/api/photo", "/api/command",
+              "/api/upload"):
         assert p in paths, f"route missing: {p}"
+
+
+def test_offline_module_inert():
+    """No Ollama here → feature absent, never loud."""
+    from core import offline as off
+    assert off.available() is False
+    assert off.chat("") is None

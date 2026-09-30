@@ -46,6 +46,12 @@ memory/initiative_state.json
 memory/routines.json
 # Conversation history is a record of what was actually said.
 memory/conversation_history.json
+# Usage ledger (call counts per tier per day).
+memory/usage.json
+# Staged facts awaiting your approval in the dashboard.
+memory/staged_facts.json
+# Consolidation cursor (last run per conversation).
+memory/consolidate_state.json
 # Belt and braces. An earlier build resolved the base directory without the
 # memory/ segment and dropped these in the repository root, where they are
 # perfectly visible to `git add .` and perfectly easy to miss in review. The
